@@ -3,7 +3,8 @@
 PDF и DOCX приходят от пользователя, поэтому их разбор нельзя выполнять в
 потоке бота: у потока нет ни таймаута, ни ограничения памяти, и отменённая
 задача оставляет его работать. Здесь разбор идёт в дочернем процессе с
-жёсткими RLIMIT; по таймауту или отмене вся группа процессов убивается.
+жёсткими RLIMIT; по таймауту и отмене группа убивается, а после завершения
+лидера добиваются осиротевшие потомки.
 """
 
 import asyncio
@@ -84,10 +85,10 @@ def _child_env() -> dict[str, str]:
     }
 
 
-async def _stop(process: asyncio.subprocess.Process) -> None:
-    # Группу убиваем даже если лидер уже завершился: потомок мог остаться в
-    # ней (например, унаследовав файл результата), а libc-парсеры умеют
-    # плодить процессы. ProcessLookupError означает, что группы уже нет.
+def _kill_group(process: asyncio.subprocess.Process) -> None:
+    # start_new_session=True делает ребёнка лидером собственной группы,
+    # поэтому её id совпадает с pid. Группу добиваем и после нормального
+    # завершения лидера: осиротевший потомок не должен пережить разбор.
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -97,12 +98,33 @@ async def _stop(process: asyncio.subprocess.Process) -> None:
             process.kill()
         except ProcessLookupError:
             pass
+
+
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    _kill_group(process)
     try:
         await asyncio.shield(process.wait())
     except asyncio.CancelledError:
         pass
     except ProcessLookupError:
         pass
+
+
+async def _send_and_wait(process: asyncio.subprocess.Process, payload: bytes) -> None:
+    # Отправка входит в общий таймаут: ребёнок может зависнуть на импорте
+    # ещё до чтения stdin, и тогда большой payload висит в drain.
+    if process.stdin is not None:
+        try:
+            process.stdin.write(payload)
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+    await process.wait()
 
 
 async def _isolated(filename: str, data: bytes, *, ocr: bool) -> Attachment:
@@ -124,20 +146,7 @@ async def _isolated(filename: str, data: bytes, *, ocr: bool) -> Attachment:
             start_new_session=True,
         )
         try:
-            if process.stdin is None:
-                await _stop(process)
-                raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
-            try:
-                process.stdin.write(payload)
-                await process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            await asyncio.wait_for(process.wait(), PARSE_TIMEOUT)
+            await asyncio.wait_for(_send_and_wait(process, payload), PARSE_TIMEOUT)
         except asyncio.TimeoutError:
             await _stop(process)
             raise AttachmentError(
@@ -146,6 +155,7 @@ async def _isolated(filename: str, data: bytes, *, ocr: bool) -> Attachment:
         except asyncio.CancelledError:
             await _stop(process)
             raise
+        _kill_group(process)
 
         if process.returncode != 0:
             # Содержимое файла и traceback в журнал не попадают.
