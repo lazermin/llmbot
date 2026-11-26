@@ -1,0 +1,16 @@
+[Unit]
+Description=llmbot Telegram LLM assistant
+
+[Service]
+Type=simple
+ExecStart=:"@PROJECT_DIR@/.venv/bin/python" "@PROJECT_DIR@/bot.py"
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=llmbot
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

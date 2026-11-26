@@ -1,0 +1,22 @@
+[Unit]
+Description=llmbot Telegram LLM assistant
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=llmbot
+Group=llmbot
+WorkingDirectory=/opt/llmbot
+ExecStart=/opt/llmbot/.venv/bin/python /opt/llmbot/bot.py
+Environment=PYTHONUNBUFFERED=1
+Environment=LLMBOT_ENV_FILE=/etc/llmbot/.env
+StateDirectory=llmbot
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
