@@ -12,6 +12,7 @@ import os
 import pickle
 import signal
 import sys
+import tempfile
 import traceback
 from pathlib import Path, PurePath
 
@@ -28,6 +29,10 @@ PARSE_TIMEOUT = 60.0
 PARSE_MEMORY = 1024**3
 PARSE_CPU = 50
 MAX_PARSES = 2
+# Attachment ограничен TEXT_LIMIT и шестью OCR-страницами, поэтому больше
+# этого объёма корректный разбор не отдаёт. Тот же предел стоит на запись
+# результата в дочернем процессе, а не только на чтение в родителе.
+MAX_OUTPUT = 64 * 1024**2
 ISOLATED_EXTENSIONS = {".pdf", ".docx"}
 
 _slots = asyncio.Semaphore(MAX_PARSES)
@@ -40,6 +45,9 @@ def _apply_limits() -> None:
         (resource.RLIMIT_AS, (PARSE_MEMORY, PARSE_MEMORY)),
         (resource.RLIMIT_CPU, (PARSE_CPU, PARSE_CPU + 5)),
         (resource.RLIMIT_CORE, (0, 0)),
+        # Результат разбора не может превысить MAX_OUTPUT: запись сверх
+        # лимита обрывает процесс, и родитель не получает гигантский файл.
+        (resource.RLIMIT_FSIZE, (MAX_OUTPUT, MAX_OUTPUT)),
     ):
         try:
             resource.setrlimit(limit, value)
@@ -77,16 +85,18 @@ def _child_env() -> dict[str, str]:
 
 
 async def _stop(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is None:
+    # Группу убиваем даже если лидер уже завершился: потомок мог остаться в
+    # ней (например, унаследовав файл результата), а libc-парсеры умеют
+    # плодить процессы. ProcessLookupError означает, что группы уже нет.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            process.kill()
         except ProcessLookupError:
             pass
-        except OSError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
     try:
         await asyncio.shield(process.wait())
     except asyncio.CancelledError:
@@ -98,40 +108,68 @@ async def _stop(process: asyncio.subprocess.Process) -> None:
 async def _isolated(filename: str, data: bytes, *, ocr: bool) -> Attachment:
     worker = Path(__file__).resolve().with_name("sandbox.py")
     payload = pickle.dumps((filename, data, ocr), protocol=5)
-    process = await asyncio.create_subprocess_exec(
-        sys.executable, "-E", "-s", str(worker),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(worker.parent),
-        env=_child_env(),
-        start_new_session=True,
-    )
+    # Результат пишем во временный файл, а не в pipe: размер записи ограничен
+    # RLIMIT_FSIZE дочернего процесса, поэтому родитель физически не может
+    # получить неограниченный буфер. stderr тоже не буферизуем: библиотеки
+    # могут писать туда неограниченно много.
+    output = tempfile.TemporaryFile()
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(payload), PARSE_TIMEOUT)
-    except asyncio.TimeoutError:
-        await _stop(process)
-        raise AttachmentError(
-            "Обработка файла заняла слишком много времени. Отправьте файл меньшего размера."
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-E", "-s", str(worker),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=output,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=str(worker.parent),
+            env=_child_env(),
+            start_new_session=True,
         )
-    except asyncio.CancelledError:
-        await _stop(process)
-        raise
+        try:
+            if process.stdin is None:
+                await _stop(process)
+                raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
+            try:
+                process.stdin.write(payload)
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            await asyncio.wait_for(process.wait(), PARSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            await _stop(process)
+            raise AttachmentError(
+                "Обработка файла заняла слишком много времени. Отправьте файл меньшего размера."
+            )
+        except asyncio.CancelledError:
+            await _stop(process)
+            raise
 
-    if process.returncode != 0:
-        # Содержимое файла и traceback в журнал не попадают.
-        LOG.warning("Разбор вложения прерван (код %s, stderr %s байт).", process.returncode, len(stderr))
-        raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
+        if process.returncode != 0:
+            # Содержимое файла и traceback в журнал не попадают.
+            LOG.warning("Разбор вложения прерван (код %s).", process.returncode)
+            raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
 
-    try:
-        status, value = pickle.loads(stdout)
-    except Exception as error:
-        raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.") from error
-    if status == "error":
-        raise AttachmentError(str(value))
-    if not isinstance(value, Attachment):
-        raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
-    return value
+        output.seek(0, os.SEEK_END)
+        if output.tell() > MAX_OUTPUT:
+            LOG.warning("Разбор вложения вернул неожиданно большой результат.")
+            raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
+        output.seek(0)
+        stdout = output.read(MAX_OUTPUT)
+
+        try:
+            status, value = pickle.loads(stdout)
+        except Exception as error:
+            raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.") from error
+        if status == "error":
+            raise AttachmentError(str(value))
+        if not isinstance(value, Attachment):
+            raise AttachmentError("Не удалось прочитать документ. Проверьте его формат и целостность.")
+        return value
+    finally:
+        output.close()
 
 
 async def extract_attachment(filename: str, data: bytes, *, ocr: bool = False) -> Attachment:

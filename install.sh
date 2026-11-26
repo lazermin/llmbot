@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_dir="$source_dir"
@@ -300,10 +300,12 @@ prepare_system_install() {
         install -o root -g llmbot -m 0640 "$source_dir/telegram-format.txt" "$format_file"
     fi
     if [[ "$source_dir" != "$project_dir" ]]; then
+        # Флаг ставим до первой замены: сбой в середине петли тоже должен
+        # запускать откат, а не оставлять смешанный набор файлов.
+        changes_made=true
         for file in "${code_files[@]}"; do
             install -m 0644 -- "$source_dir/$file" "$project_dir/$file"
         done
-        changes_made=true
         if [[ ! -e "$project_dir/prompt.txt" ]]; then
             install -m 0644 -- "$source_dir/prompt.txt" "$project_dir/prompt.txt"
         fi
@@ -352,8 +354,8 @@ if "$system_service"; then
             runuser -u llmbot -g llmbot -- env -i LLMBOT_ENV_FILE="$env_file" "$venv_python" "$project_dir/bot.py" --check-config
         )
     fi
-    install -m 0644 -- "$source_dir/llmbot-system.service" "$unit_path"
     changes_made=true
+    install -m 0644 -- "$source_dir/llmbot-system.service" "$unit_path"
     systemctl daemon-reload
     systemctl restart "$service"
     if ! service_active; then

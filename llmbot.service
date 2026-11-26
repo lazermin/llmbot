@@ -1,6 +1,10 @@
 [Unit]
 Description=llmbot Telegram LLM assistant
 
+# Пользовательский режим: namespace-опции (ProtectSystem, PrivateTmp,
+# CapabilityBoundingSet и т.п.) требуют user namespace, который на Ubuntu
+# 24.04+ по умолчанию ограничен AppArmor. Поэтому здесь только настройки,
+# не зависящие от namespace. Для полной изоляции ставьте системный сервис.
 [Service]
 Type=simple
 ExecStart=:"@PROJECT_DIR@/.venv/bin/python" "@PROJECT_DIR@/bot.py"
@@ -9,10 +13,6 @@ StateDirectory=llmbot
 StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=yes
-CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=yes
-RestrictRealtime=yes
 Restart=on-failure
 RestartSec=10
 
