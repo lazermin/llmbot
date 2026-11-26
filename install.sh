@@ -77,6 +77,13 @@ rollback_system() {
     if [[ -n "$code_backup" && -d "$code_backup" ]]; then
         cp -a -- "$code_backup/." "$project_dir/" >/dev/null 2>&1
     fi
+    # Файлы, которых не было в резервной копии, при откате удаляем: иначе
+    # новая версия оставит после себя модули, несовместимые со старой.
+    for file in "${code_files[@]}"; do
+        if [[ ! -e "$code_backup/$file" ]]; then
+            rm -f -- "$project_dir/$file" >/dev/null 2>&1
+        fi
+    done
     if [[ "$old_unit" == true ]]; then
         install -m 0644 -- "$backup_dir/unit" "$unit_path" >/dev/null 2>&1
     else
