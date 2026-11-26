@@ -37,12 +37,13 @@ from openai import APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 from access import Access, Jobs, state_dir
 from attachments import (
     Attachment, AttachmentError, DOC_LIMIT, DOCUMENT_EXTENSIONS, IMAGE_EXTENSIONS, IMAGE_LIMIT,
-    LimitedBuffer, PageImage, extract_text, image_url, size_message,
+    LimitedBuffer, PageImage, image_url, size_message,
 )
 from credentials import read_llm_credential
 from dialogues import DOCUMENT_CONTEXT_LIMIT, Dialogues, Reply, Request, Retry
 from evidence import Evidence, FIND_HELP, Search, choose_lines, find_lines, parse_search, verify_references
 from redaction import redact
+from sandbox import extract_attachment
 from telegram_format import formatted_chunks, telegram_chunks
 
 ROOT = Path(__file__).resolve().parent
@@ -898,8 +899,8 @@ def make_router(conversation: Conversation, access: Access | None = None, jobs: 
                     raise AttachmentError("Поддерживаются PDF, DOCX и текстовые файлы, например .txt, .log, .conf и .csv.")
                 data = await download_input(bot, document, DOC_LIMIT)
                 label = " ".join(filename.split())[:160]
-                extracted = await asyncio.to_thread(
-                    extract_text, filename, data, ocr=bool(conversation.settings.vision_model)
+                extracted = await extract_attachment(
+                    filename, data, ocr=bool(conversation.settings.vision_model)
                 )
                 attachment = replace(extracted, name=label)
         except AttachmentError as error:

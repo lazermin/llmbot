@@ -8,9 +8,22 @@ service=llmbot.service
 setup_service=true
 enable_linger=false
 system_service=false
+unit_path="/etc/systemd/system/$service"
+user_unit=""
+backup_dir=""
+code_backup=""
+changes_made=false
+old_unit=false
+old_user_unit=false
+code_files=(bot.py telegram_format.py attachments.py sandbox.py dialogues.py access.py
+    evidence.py redaction.py credentials.py encrypt-api-key.py requirements.txt VERSION)
 
 fail() {
     printf '%s\n' "$*" >&2
+    # Если код уже заменён, явный fail тоже должен откатить установку.
+    if [[ "$changes_made" == true && -n "$backup_dir" && -d "$backup_dir" ]] && "$system_service"; then
+        rollback_system
+    fi
     exit 1
 }
 
@@ -51,6 +64,87 @@ as_root() {
     else
         sudo "$@"
     fi
+}
+
+rollback_system() {
+    trap - ERR
+    if [[ "$changes_made" != true ]]; then
+        [[ -n "$backup_dir" ]] && rm -rf -- "$backup_dir"
+        exit 1
+    fi
+    set +e
+    systemctl stop "$service" >/dev/null 2>&1
+    if [[ -n "$code_backup" && -d "$code_backup" ]]; then
+        cp -a -- "$code_backup/." "$project_dir/" >/dev/null 2>&1
+    fi
+    if [[ "$old_unit" == true ]]; then
+        install -m 0644 -- "$backup_dir/unit" "$unit_path" >/dev/null 2>&1
+    else
+        rm -f -- "$unit_path"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1
+    if [[ "$old_unit" == true ]]; then
+        systemctl restart "$service" >/dev/null 2>&1
+    fi
+    rm -rf -- "$backup_dir"
+    if [[ "$old_unit" == true || -n "$code_backup" ]]; then
+        printf '%s\n' 'Установка прервана. Предыдущая версия восстановлена; проверьте systemctl status llmbot.service.' >&2
+    else
+        printf '%s\n' 'Установка прервана. Изменения отменены.' >&2
+    fi
+    exit 1
+}
+
+rollback_user() {
+    trap - ERR
+    set +e
+    systemctl --user stop "$service" >/dev/null 2>&1
+    if [[ "$old_user_unit" == true ]]; then
+        install -m 0644 -- "$backup_dir/unit" "$user_unit" >/dev/null 2>&1
+    else
+        rm -f -- "$user_unit"
+    fi
+    systemctl --user daemon-reload >/dev/null 2>&1
+    if [[ "$old_user_unit" == true ]]; then
+        systemctl --user restart "$service" >/dev/null 2>&1
+    fi
+    rm -rf -- "$backup_dir"
+    printf '%s\n' 'Установка прервана. Конфигурация пользовательского сервиса восстановлена.' >&2
+    exit 1
+}
+
+service_active() {
+    local attempt state
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        state="$(systemctl is-active "$service" 2>/dev/null || true)"
+        if [[ "$state" == active ]]; then
+            sleep 1
+            if systemctl is-active --quiet "$service"; then
+                return 0
+            fi
+        elif [[ "$state" == failed ]]; then
+            return 1
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+user_service_active() {
+    local attempt state
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        state="$(systemctl --user is-active "$service" 2>/dev/null || true)"
+        if [[ "$state" == active ]]; then
+            sleep 1
+            if systemctl --user is-active --quiet "$service"; then
+                return 0
+            fi
+        elif [[ "$state" == failed ]]; then
+            return 1
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 usable_python() {
@@ -170,9 +264,24 @@ configure_env() (
 )
 
 prepare_system_install() {
-    local account account_uid account_home account_shell
+    local account account_uid account_home account_shell file
     systemctl show-environment >/dev/null ||
         fail "Системный systemd недоступен. Для ручного запуска используйте --no-service."
+
+    # Резервная копия заменяемых файлов: при сбое установки вернём как было.
+    if [[ -d "$project_dir" ]]; then
+        code_backup="$backup_dir/code"
+        install -d -m 0700 -- "$code_backup"
+        for file in "${code_files[@]}"; do
+            if [[ -f "$project_dir/$file" ]]; then
+                cp -a -- "$project_dir/$file" "$code_backup/$file"
+            fi
+        done
+    fi
+    if [[ -f "$unit_path" ]]; then
+        cp -a -- "$unit_path" "$backup_dir/unit"
+        old_unit=true
+    fi
 
     if account="$(getent passwd llmbot)"; then
         IFS=: read -r _ _ account_uid _ _ account_home account_shell <<< "$account"
@@ -191,15 +300,19 @@ prepare_system_install() {
         install -o root -g llmbot -m 0640 "$source_dir/telegram-format.txt" "$format_file"
     fi
     if [[ "$source_dir" != "$project_dir" ]]; then
-        install -m 0644 "$source_dir/"{bot.py,telegram_format.py,attachments.py,dialogues.py,access.py,evidence.py,redaction.py,credentials.py,encrypt-api-key.py} \
-            "$source_dir/requirements.txt" "$source_dir/VERSION" "$project_dir/"
+        for file in "${code_files[@]}"; do
+            install -m 0644 -- "$source_dir/$file" "$project_dir/$file"
+        done
+        changes_made=true
         if [[ ! -e "$project_dir/prompt.txt" ]]; then
-            install -m 0644 "$source_dir/prompt.txt" "$project_dir/prompt.txt"
+            install -m 0644 -- "$source_dir/prompt.txt" "$project_dir/prompt.txt"
         fi
     fi
 }
 
 if "$system_service"; then
+    backup_dir="$(mktemp -d)"
+    trap 'rollback_system' ERR
     # Код и виртуальное окружение должны быть доступны сервису при любом umask root.
     umask 022
     prepare_system_install
@@ -239,10 +352,17 @@ if "$system_service"; then
             runuser -u llmbot -g llmbot -- env -i LLMBOT_ENV_FILE="$env_file" "$venv_python" "$project_dir/bot.py" --check-config
         )
     fi
-    install -m 0644 "$source_dir/llmbot-system.service" "/etc/systemd/system/$service"
+    install -m 0644 -- "$source_dir/llmbot-system.service" "$unit_path"
+    changes_made=true
     systemctl daemon-reload
-    systemctl enable "$service"
     systemctl restart "$service"
+    if ! service_active; then
+        printf '%s\n' 'Сервис llmbot.service не запустился. Восстанавливаю предыдущую версию.' >&2
+        rollback_system
+    fi
+    systemctl enable "$service"
+    trap - ERR
+    rm -rf -- "$backup_dir"
     printf '%s\n' 'Конфигурация: /etc/llmbot/.env' \
         'Статус: systemctl status llmbot.service' \
         'Журнал: journalctl -u llmbot.service -f'
@@ -257,19 +377,36 @@ if "$setup_service" && ! "$system_service"; then
 
     unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$unit_dir"
+    user_unit="$unit_dir/$service"
     unit="$(< "$project_dir/llmbot.service")"
-    unit_path="${project_dir//\\/\\\\}"
-    unit_path="${unit_path//\"/\\\"}"
-    unit_path="${unit_path//%/%%}"
-    [[ "$unit_path" != *$'\n'* && "$unit_path" != *$'\r'* ]] ||
+    escaped_project="${project_dir//\\/\\\\}"
+    escaped_project="${escaped_project//\"/\\\"}"
+    escaped_project="${escaped_project//%/%%}"
+    [[ "$escaped_project" != *$'\n'* && "$escaped_project" != *$'\r'* ]] ||
         fail "Для systemd используйте путь проекта без переводов строк."
-    printf '%s\n' "${unit//@PROJECT_DIR@/"$unit_path"}" > "$unit_dir/$service"
-    systemctl --user daemon-reload
-    systemctl --user enable "$service"
-    systemctl --user restart "$service"
-    if "$enable_linger"; then
-        loginctl enable-linger "$(id -un)" || as_root loginctl enable-linger "$(id -un)"
+    backup_dir="$(mktemp -d)"
+    old_user_unit=false
+    if [[ -f "$user_unit" ]]; then
+        cp -a -- "$user_unit" "$backup_dir/unit"
+        old_user_unit=true
     fi
+    trap 'rollback_user' ERR
+    printf '%s\n' "${unit//@PROJECT_DIR@/"$escaped_project"}" > "$user_unit"
+    systemctl --user daemon-reload
+    systemctl --user restart "$service"
+    if ! user_service_active; then
+        printf '%s\n' 'Пользовательский сервис llmbot.service не запустился. Восстанавливаю предыдущую конфигурацию.' >&2
+        rollback_user
+    fi
+    systemctl --user enable "$service"
+    if "$enable_linger"; then
+        if ! loginctl enable-linger "$(id -un)"; then
+            as_root loginctl enable-linger "$(id -un)" ||
+                printf '%s\n' 'Не удалось включить linger; сервис будет работать только при входе в систему.' >&2
+        fi
+    fi
+    trap - ERR
+    rm -rf -- "$backup_dir"
     printf '%s\n' 'Статус: systemctl --user status llmbot.service' \
         'Журнал: journalctl --user -u llmbot.service -f'
 fi
