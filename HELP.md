@@ -199,18 +199,6 @@ bash update.sh --target /путь/к/установленному/llmbot
 
 При обновлении с прежней модели на прямом API DeepSeek распознаваемые веб-запросы и команда `/web` используют `deepseek-flash`. В этом же режиме анализ изображений доступен с `LLM_VISION_MODEL=auto`, включая конфигурации, в которых этот параметр ещё отсутствует.
 
-## Переход с Linux Tips Bot
-
-Если используете тот же Telegram-токен, сначала остановите прежний сервис на сервере, где он запущен.
-
-```bash
-systemctl --user disable --now linux-tips-bot.service
-# Для прежней системной установки вместо команды выше:
-# sudo systemctl disable --now linux-tips-bot.service
-```
-
-Перенесите из старого `.env` только `BOT_TOKEN`, `ADMIN_ID`, `LLM_BASE_URL`, `LLM_MODEL` и `LLM_API_KEY`. `ADMIN_ID` по-прежнему обозначает Telegram ID владельца. Для профиля бота можно отдельно поменять имя через BotFather.
-
 ## Диагностика
 
 Для системного сервиса выполните от root `systemctl status llmbot.service` и `journalctl -u llmbot.service -n 50 --no-pager`. Для пользовательского сервиса выполните следующие команды.
